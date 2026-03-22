@@ -28442,22 +28442,41 @@ export function createTypeEvaluator(
             if (
                 effectiveReturnType &&
                 isClassInstance(effectiveReturnType) &&
+                ClassType.isBuiltIn(effectiveReturnType, 'ParametricSelf') &&
                 effectiveReturnType.shared.fullName === 'typing_extensions.ParametricSelf' &&
-                isClassInstance(baseType)
+                isClassInstance(baseType) &&
+                baseType.shared.typeParams.length > 0 // Guard: Receiver must be generic
             ) {
                 const newTypeArgs = effectiveReturnType.priv.typeArgs;
                 if (newTypeArgs && newTypeArgs.length > 0) {
-                    const substituted = ClassType.specialize(baseType, newTypeArgs, /* isTypeArgExplicit */ true);
-                    const existingSpecialized = specializedFunction.priv.specializedTypes;
-                    const newSpecializedTypes: SpecializedFunctionTypes = {
-                        parameterTypes:
-                            existingSpecialized?.parameterTypes ??
-                            new Array(specializedFunction.shared.parameters.length).fill(undefined),
-                        parameterDefaultTypes: existingSpecialized?.parameterDefaultTypes,
-                        returnType: substituted,
-                    };
-                    const cloned = FunctionType.specialize(specializedFunction, newSpecializedTypes);
-                    return FunctionType.clone(cloned, stripFirstParam, baseType);
+                    // ParametricSelf uses TypeVarTuple (*Ts), args come as *tuple[B] — unwrap
+                    let resolvedArgs: Type[] = newTypeArgs;
+                    if (newTypeArgs.length === 1) {
+                        const firstArg = newTypeArgs[0];
+                        if (
+                            isUnpacked(firstArg) &&
+                            isClassInstance(firstArg) &&
+                            ClassType.isBuiltIn(firstArg, 'tuple')
+                        ) {
+                            resolvedArgs = firstArg.priv.typeArgs ?? newTypeArgs;
+                        }
+                    }
+
+                    // Arity check: resolved args must match receiver's type params
+                    if (resolvedArgs.length === baseType.shared.typeParams.length) {
+                        const substituted = ClassType.specialize(baseType, resolvedArgs, /* isTypeArgExplicit */ true);
+                        const existingSpecialized = specializedFunction.priv.specializedTypes;
+                        const newSpecializedTypes: SpecializedFunctionTypes = {
+                            parameterTypes:
+                                existingSpecialized?.parameterTypes ??
+                                new Array(specializedFunction.shared.parameters.length).fill(undefined),
+                            parameterDefaultTypes: existingSpecialized?.parameterDefaultTypes,
+                            returnType: substituted,
+                        };
+                        const cloned = FunctionType.specialize(specializedFunction, newSpecializedTypes);
+                        return FunctionType.clone(cloned, stripFirstParam, baseType);
+                    }
+                    // If arity mismatch, fall through to default handling
                 }
             }
             // ── end ParametricSelf ────────────────────────────────────────
