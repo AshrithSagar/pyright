@@ -269,6 +269,7 @@ import {
     removeFromUnion,
     removeUnbound,
     SentinelLiteral,
+    SpecializedFunctionTypes,
     TupleTypeArg,
     Type,
     TypeAliasInfo,
@@ -28431,6 +28432,36 @@ export function createTypeEvaluator(
 
         const specializedFunction = solveAndApplyConstraints(memberType, constraints);
         if (isFunction(specializedFunction)) {
+            // ── ParametricSelf substitution ───────────────────────────────
+            // Proposed in https://github.com/AshrithSagar/pyHKTs
+            // If return type is ParametricSelf[B], substitute with F[B]
+            // where F is the receiver's concrete class.
+            const effectiveReturnType =
+                specializedFunction.priv.specializedTypes?.returnType ?? specializedFunction.shared.declaredReturnType;
+
+            if (
+                effectiveReturnType &&
+                isClassInstance(effectiveReturnType) &&
+                effectiveReturnType.shared.fullName === 'typing_extensions.ParametricSelf' &&
+                isClassInstance(baseType)
+            ) {
+                const newTypeArgs = effectiveReturnType.priv.typeArgs;
+                if (newTypeArgs && newTypeArgs.length > 0) {
+                    const substituted = ClassType.specialize(baseType, newTypeArgs, /* isTypeArgExplicit */ true);
+                    const existingSpecialized = specializedFunction.priv.specializedTypes;
+                    const newSpecializedTypes: SpecializedFunctionTypes = {
+                        parameterTypes:
+                            existingSpecialized?.parameterTypes ??
+                            new Array(specializedFunction.shared.parameters.length).fill(undefined),
+                        parameterDefaultTypes: existingSpecialized?.parameterDefaultTypes,
+                        returnType: substituted,
+                    };
+                    const cloned = FunctionType.specialize(specializedFunction, newSpecializedTypes);
+                    return FunctionType.clone(cloned, stripFirstParam, baseType);
+                }
+            }
+            // ── end ParametricSelf ────────────────────────────────────────
+
             return FunctionType.clone(specializedFunction, stripFirstParam, baseType);
         }
 
