@@ -23,6 +23,7 @@ import {
     isClass,
     isClassInstance,
     isInstantiableClass,
+    isKindVar,
     isNever,
     isParamSpec,
     isTypeSame,
@@ -98,6 +99,9 @@ export const enum PrintTypeFlags {
 
     // Omit TypeVar scopes.
     OmitTypeVarScope = 1 << 13,
+
+    // Omit KindVar scopes.
+    OmitKindVarScope = 1 << 14,
 }
 
 export type FunctionReturnTypeCallback = (type: FunctionType) => Type;
@@ -648,6 +652,25 @@ function printTypeInternal(
                 }
 
                 return typeVarName;
+            }
+
+            case TypeCategory.KindApplication: {
+                const constructorName = getReadableTypeVarName(
+                    type.shared.constructor,
+                    (printTypeFlags & PrintTypeFlags.PythonSyntax) === 0 &&
+                        (printTypeFlags & PrintTypeFlags.OmitKindVarScope) === 0
+                );
+                const argStrings = type.shared.args.map((arg) =>
+                    printTypeInternal(
+                        arg,
+                        printTypeFlags,
+                        returnTypeCallback,
+                        uniqueNameMap,
+                        recursionTypes,
+                        recursionCount
+                    )
+                );
+                return `${constructorName}[${argStrings.join(', ')}]`;
             }
 
             case TypeCategory.Never: {
@@ -1466,6 +1489,14 @@ class UniqueNameMap {
 
                     type.priv.typeAliasSources?.forEach((typeAliasSource) => {
                         this.build(typeAliasSource, recursionTypes, recursionCount);
+                    });
+                    break;
+                }
+
+                case TypeCategory.KindApplication: {
+                    this.build(type.shared.constructor, recursionTypes, recursionCount);
+                    type.shared.args.forEach((arg) => {
+                        this.build(arg, recursionTypes, recursionCount);
                     });
                     break;
                 }

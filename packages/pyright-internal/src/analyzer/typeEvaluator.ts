@@ -245,6 +245,8 @@ import {
     isFunction,
     isFunctionOrOverloaded,
     isInstantiableClass,
+    isKindApplication,
+    isKindVar,
     isMethodType,
     isModule,
     isNever,
@@ -260,6 +262,8 @@ import {
     isUnpacked,
     isUnpackedClass,
     isUnpackedTypeVarTuple,
+    KindApplicationType,
+    KindVarType,
     LiteralValue,
     maxTypeRecursionCount,
     ModuleType,
@@ -1999,7 +2003,8 @@ export function createTypeEvaluator(
             case TypeCategory.Function:
             case TypeCategory.Overloaded:
             case TypeCategory.Module:
-            case TypeCategory.TypeVar: {
+            case TypeCategory.TypeVar:
+            case TypeCategory.KindApplication: {
                 return false;
             }
 
@@ -2108,6 +2113,7 @@ export function createTypeEvaluator(
             case TypeCategory.Overloaded:
             case TypeCategory.Module:
             case TypeCategory.TypeVar:
+            case TypeCategory.KindApplication:
             case TypeCategory.Never:
             case TypeCategory.Any: {
                 return true;
@@ -4240,6 +4246,12 @@ export function createTypeEvaluator(
             }
 
             if (isTypeVar(subtype)) {
+                // KindVar represents a type constructor — never make it concrete,
+                // it will be substituted by the TypeVarTransformer when solved.
+                if (isKindVar(subtype)) {
+                    return subtype;
+                }
+
                 // If this is a recursive type alias placeholder
                 // that hasn't yet been resolved, return it as is.
                 if (subtype.shared.recursiveAlias) {
@@ -4940,6 +4952,14 @@ export function createTypeEvaluator(
 
             // Add TypeForm details if appropriate.
             type = addTypeFormForSymbol(node, type, flags, !!effectiveTypeInfo.includesVariableDecl);
+
+            // Prevent KindVar from being converted to its runtime class value,
+            // but preserve the scoped version that validateTypeVarUsage produced.
+            const preConvertType = type;
+            type = convertSpecialFormToRuntimeValue(type, flags);
+            if (isTypeVar(preConvertType) && isKindVar(preConvertType) && !isTypeVar(type)) {
+                type = preConvertType;
+            }
         } else {
             // Handle the special case of "reveal_type" and "reveal_locals".
             if (name === 'reveal_type' || name === 'reveal_locals') {
@@ -5090,6 +5110,10 @@ export function createTypeEvaluator(
             return type;
         }
 
+        if (isTypeVar(type) && isKindVar(type)) {
+            return type;
+        }
+
         if (
             convertModule &&
             isModule(type) &&
@@ -5121,6 +5145,12 @@ export function createTypeEvaluator(
 
         if (type.props?.typeForm) {
             return TypeBase.cloneWithTypeForm(type.props.specialForm, type.props.typeForm);
+        }
+
+        // KindVar should never be converted to its runtime class value —
+        // it is always meaningful as a type constructor, not a runtime object.
+        if (isTypeVar(type) && isKindVar(type)) {
+            return type;
         }
 
         return type.props.specialForm;
@@ -6131,6 +6161,12 @@ export function createTypeEvaluator(
                         flags
                     ).type;
                 }
+                break;
+            }
+
+            case TypeCategory.KindApplication: {
+                // Member access on F[A] — treat as unknown for now
+                type = UnknownType.create(isIncomplete);
                 break;
             }
 
@@ -7701,6 +7737,21 @@ export function createTypeEvaluator(
             baseTypeResult.type,
             /* options */ undefined,
             (concreteSubtype, unexpandedSubtype) => {
+                // Handle KindVar subscript before any expansion/unknown checks
+                if (isTypeVar(unexpandedSubtype) && isKindVar(unexpandedSubtype)) {
+                    const typeArgs = getTypeArgs(node, flags).map((t) => convertToInstance(t.type));
+                    const kindArity = unexpandedSubtype.priv.kindArity ?? 1;
+                    if (typeArgs.length !== kindArity) {
+                        addDiagnostic(
+                            DiagnosticRule.reportGeneralTypeIssues,
+                            `KindVar "${unexpandedSubtype.shared.name}" expects ${kindArity} type argument(s), got ${typeArgs.length}`,
+                            node.d.leftExpr
+                        );
+                        return UnknownType.create();
+                    }
+                    return KindApplicationType.create(unexpandedSubtype, typeArgs);
+                }
+
                 const selfType = isTypeVar(unexpandedSubtype) ? unexpandedSubtype : undefined;
 
                 if (isAnyOrUnknown(concreteSubtype)) {
@@ -10523,6 +10574,12 @@ export function createTypeEvaluator(
             if (className === 'ParamSpec') {
                 return {
                     returnType: createParamSpecType(errorNode, expandedCallType, argList),
+                };
+            }
+
+            if (className === 'KindVar') {
+                return {
+                    returnType: createKindVarType(errorNode, expandedCallType, argList),
                 };
             }
 
@@ -13459,6 +13516,86 @@ export function createTypeEvaluator(
         addDiagnostic(DiagnosticRule.reportGeneralTypeIssues, LocMessage.paramSpecDefaultNotTuple(), node);
 
         return undefined;
+    }
+
+    function createKindVarType(errorNode: ExpressionNode, classType: ClassType, argList: Arg[]): Type | undefined {
+        let kindVarName = '';
+        let defaultValueNode: ExpressionNode | undefined;
+
+        if (argList.length === 0) {
+            addDiagnostic(DiagnosticRule.reportGeneralTypeIssues, LocMessage.typeVarFirstArg(), errorNode);
+            return undefined;
+        }
+
+        const firstArg = argList[0];
+        if (firstArg.valueExpression && firstArg.valueExpression.nodeType === ParseNodeType.StringList) {
+            kindVarName = firstArg.valueExpression.d.strings.map((s) => s.d.value).join('');
+        } else {
+            addDiagnostic(
+                DiagnosticRule.reportGeneralTypeIssues,
+                LocMessage.typeVarFirstArg(),
+                firstArg.valueExpression || errorNode
+            );
+        }
+
+        // Create as KindVar kind
+        const kindVar = TypeBase.cloneAsSpecialForm(
+            TypeVarType.createInstantiable(kindVarName, TypeVarKind.KindVar),
+            ClassType.cloneAsInstance(classType)
+        ) as KindVarType;
+
+        // Default kindArity is 1
+        kindVar.priv.kindArity = 1;
+
+        // Parse remaining parameters
+        for (let i = 1; i < argList.length; i++) {
+            const paramNameNode = argList[i].name;
+            const paramName = paramNameNode ? paramNameNode.d.value : undefined;
+
+            if (paramName === 'bound') {
+                const argType =
+                    argList[i].typeResult?.type ??
+                    getTypeOfExpressionExpectingType(argList[i].valueExpression!, {
+                        noNonTypeSpecialForms: true,
+                        typeExpression: true,
+                        parsesStringLiteral: true,
+                    }).type;
+                kindVar.shared.boundType = convertToInstance(argType);
+            } else if (paramName === 'kind') {
+                // kind=1 means F[A], kind=2 means F[A, B], etc.
+                const argExpr = argList[i].valueExpression;
+                if (argExpr && argExpr.nodeType === ParseNodeType.Number) {
+                    const kindArity = Number(argExpr.d.value);
+                    if (kindArity >= 1) {
+                        kindVar.priv.kindArity = kindArity;
+                    } else {
+                        addDiagnostic(
+                            DiagnosticRule.reportGeneralTypeIssues,
+                            LocMessage.typeVarUnknownParam().format({ name: 'kind' }),
+                            argExpr
+                        );
+                    }
+                }
+            } else if (paramName === 'default') {
+                defaultValueNode = argList[i].valueExpression;
+                const argType =
+                    argList[i].typeResult?.type ??
+                    getTypeOfExpressionExpectingType(defaultValueNode!, {
+                        allowTypeVarsWithoutScopeId: true,
+                        typeExpression: true,
+                    }).type;
+                kindVar.shared.defaultType = convertToInstance(argType);
+                kindVar.shared.isDefaultExplicit = true;
+            } else if (paramName) {
+                addDiagnostic(
+                    DiagnosticRule.reportCallIssue,
+                    LocMessage.typeVarUnknownParam().format({ name: paramName }),
+                    argList[i].node?.d.name || argList[i].valueExpression || errorNode
+                );
+            }
+        }
+
+        return kindVar;
     }
 
     // Handles a call to TypeAliasType(). This special form allows a caller to programmatically
@@ -22944,6 +23081,7 @@ export function createTypeEvaluator(
                         'TypeVar',
                         'ParamSpec',
                         'TypeVarTuple',
+                        'KindVar',
                         'TypedDict',
                         'NamedTuple',
                         'NewType',
@@ -24792,6 +24930,95 @@ export function createTypeEvaluator(
         // error will be reported elsewhere.
         if (isUnbound(destType) || isUnbound(srcType)) {
             return true;
+        }
+
+        // Handle KindVar as destination — F matches any type constructor
+        if (isKindVar(destType)) {
+            if (constraints) {
+                constraints.setBounds(destType, srcType);
+            }
+            return true;
+        }
+
+        // Handle KindApplication as destination — F[A] matches F[B] or list[X]
+        if (isKindApplication(destType)) {
+            // If the KindVar constructor is already solved, substitute first
+            if (constraints) {
+                const entry = constraints.getMainConstraintSet().getTypeVar(destType.shared.constructor);
+                const solved = entry?.lowerBound; // The concrete type F was solved to
+                if (solved && isClass(solved)) {
+                    const instantiable = TypeBase.isInstance(solved) ? ClassType.cloneAsInstantiable(solved) : solved;
+                    const concreteDest = ClassType.cloneAsInstance(
+                        ClassType.specialize(instantiable, destType.shared.args as Type[], true)
+                    );
+                    return assignType(concreteDest, srcType, diag, constraints, flags, recursionCount);
+                }
+            }
+            // F[A] = F[B] — same constructor, constrain args
+            if (isKindApplication(srcType)) {
+                if (constraints) {
+                    // Constrain the constructors
+                    constraints.setBounds(destType.shared.constructor, srcType.shared.constructor);
+                }
+                // Constrain args pairwise
+                const minLen = Math.min(destType.shared.args.length, srcType.shared.args.length);
+                for (let i = 0; i < minLen; i++) {
+                    if (
+                        !assignType(
+                            destType.shared.args[i],
+                            srcType.shared.args[i],
+                            diag,
+                            constraints,
+                            flags,
+                            recursionCount
+                        )
+                    ) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            // F[A] = list[X] — constructor already solved, constrain args
+            if (isClassInstance(srcType) && srcType.priv.typeArgs) {
+                const minLen = Math.min(destType.shared.args.length, srcType.priv.typeArgs.length);
+                for (let i = 0; i < minLen; i++) {
+                    if (
+                        !assignType(
+                            destType.shared.args[i],
+                            srcType.priv.typeArgs[i],
+                            diag,
+                            constraints,
+                            flags,
+                            recursionCount
+                        )
+                    ) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            if (isAnyOrUnknown(srcType)) {
+                return true;
+            }
+
+            diag?.addMessage(LocAddendum.typeAssignmentMismatch().format(printSrcDestTypes(destType, srcType)));
+            return false;
+        }
+
+        // Handle KindApplication as source — F[A] is assignable to object
+        if (isKindApplication(srcType)) {
+            if (isClassInstance(destType) && ClassType.isBuiltIn(destType, 'object')) {
+                return true;
+            }
+            if (isAnyOrUnknown(destType)) {
+                return true;
+            }
+            // KindVar src being assigned to KindVar dest — handled above in isTypeVar(destType)
+            // Fall through to error
+            diag?.addMessage(LocAddendum.typeAssignmentMismatch().format(printSrcDestTypes(destType, srcType)));
+            return false;
         }
 
         if (isTypeVar(destType)) {

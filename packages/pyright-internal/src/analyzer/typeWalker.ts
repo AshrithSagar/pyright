@@ -13,6 +13,7 @@ import {
     AnyType,
     ClassType,
     FunctionType,
+    KindApplicationType,
     ModuleType,
     NeverType,
     OverloadedType,
@@ -94,6 +95,13 @@ export class TypeWalker {
             case TypeCategory.TypeVar:
                 this.visitTypeVar(type);
                 break;
+
+            case TypeCategory.KindApplication: {
+                const kindApp = type as KindApplicationType;
+                this.walk(kindApp.shared.constructor);
+                kindApp.shared.args.forEach((arg) => this.walk(arg));
+                break;
+            }
 
             default:
                 assertNever(type);

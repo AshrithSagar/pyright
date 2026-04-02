@@ -96,6 +96,10 @@ export function createTracePrinter(roots: Uri[], includeRoots: boolean = false):
                 case TypeCategory.Unknown:
                     return `Unknown ${wrap(type.props?.typeAliasInfo?.shared.fullName)}`;
 
+                case TypeCategory.KindApplication: {
+                    return `KindApplication '${type.shared.constructor.shared.name}[${type.shared.args.length}]'`;
+                }
+
                 default:
                     assertNever(type);
             }

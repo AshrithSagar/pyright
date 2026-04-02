@@ -32,6 +32,8 @@ import {
     isFunctionOrOverloaded,
     isInstantiableClass,
     isKeywordOnlySeparator,
+    isKindApplication,
+    isKindVar,
     isNever,
     isOverloaded,
     isParamSpec,
@@ -45,6 +47,8 @@ import {
     isUnpackedClass,
     isUnpackedTypeVar,
     isUnpackedTypeVarTuple,
+    KindApplicationType,
+    KindVarType,
     maxTypeRecursionCount,
     ModuleType,
     NeverType,
@@ -953,6 +957,7 @@ export function addConditionToType<T extends Type>(
         case TypeCategory.Never:
         case TypeCategory.Module:
         case TypeCategory.TypeVar:
+        case TypeCategory.KindApplication:
             return type;
 
         case TypeCategory.Function:
@@ -979,6 +984,7 @@ export function getTypeCondition(type: Type): TypeCondition[] | undefined {
         case TypeCategory.Never:
         case TypeCategory.Module:
         case TypeCategory.TypeVar:
+        case TypeCategory.KindApplication:
         case TypeCategory.Overloaded:
         case TypeCategory.Union:
             return undefined;
@@ -2333,6 +2339,10 @@ export function isEffectivelyInstantiable(type: Type, options?: IsInstantiableOp
         }
     }
 
+    if (isKindApplication(type)) {
+        return true;
+    }
+
     // Handle the special case of 'type' (or subclasses thereof),
     // which are instantiable.
     if (isMetaclassInstance(type)) {
@@ -2390,6 +2400,9 @@ export function convertToInstance(type: Type, includeSubclasses = true): Type {
 
                 case TypeCategory.TypeVar: {
                     if (TypeBase.isInstantiable(subtype)) {
+                        if (isKindVar(subtype)) {
+                            return subtype;
+                        }
                         return TypeVarType.cloneAsInstance(subtype);
                     }
                     break;
@@ -2437,6 +2450,10 @@ export function convertToInstance(type: Type, includeSubclasses = true): Type {
 }
 
 export function convertToInstantiable(type: Type, includeSubclasses = true): Type {
+    if (isKindApplication(type)) {
+        return type;
+    }
+
     // See if we've already performed this conversion and cached it.
     if (type.cached?.instantiableType) {
         return type.cached.instantiableType;
@@ -3043,6 +3060,17 @@ function _requiresSpecialization(type: Type, options?: RequiresSpecializationOpt
             if (aliasInfo?.typeArgs) {
                 return aliasInfo.typeArgs.some((typeArg) => requiresSpecialization(typeArg, options, recursionCount));
             }
+
+            return false;
+        }
+
+        case TypeCategory.KindApplication: {
+            // Requires specialization if the constructor KindVar is unsolved
+            // or if any args require specialization
+            if (requiresSpecialization(type.shared.constructor, options, recursionCount)) {
+                return true;
+            }
+            return type.shared.args.some((arg) => requiresSpecialization(arg, options, recursionCount));
         }
     }
 
@@ -3535,6 +3563,37 @@ export class TypeVarTransformer {
             }
 
             return replacementType;
+        }
+
+        if (isKindApplication(type)) {
+            // Check if the KindVar constructor itself is being solved
+            const transformedConstructor = this.transformTypeVar(type.shared.constructor, recursionCount);
+            const newArgs = type.shared.args.map((arg) => this.apply(arg, recursionCount));
+
+            const argsChanged = newArgs.some((arg, i) => arg !== type.shared.args[i]);
+
+            if (transformedConstructor !== undefined && transformedConstructor !== type.shared.constructor) {
+                // Only collapse if F was solved to a concrete class, not just rebound
+                if (isClass(transformedConstructor)) {
+                    const instantiable = TypeBase.isInstance(transformedConstructor)
+                        ? ClassType.cloneAsInstantiable(transformedConstructor)
+                        : transformedConstructor;
+                    const specialized = ClassType.specialize(instantiable, newArgs as Type[], true);
+                    return ClassType.cloneAsInstance(specialized);
+                }
+                // For KindVar→KindVar (rebinding), just update the constructor
+                if (isKindVar(transformedConstructor)) {
+                    return KindApplicationType.create(transformedConstructor, newArgs);
+                }
+                // For anything else unexpected, return unchanged
+                return KindApplicationType.create(type.shared.constructor, newArgs);
+            }
+
+            if (argsChanged) {
+                return KindApplicationType.create(type.shared.constructor, newArgs);
+            }
+
+            return type;
         }
 
         if (isUnion(type)) {
@@ -4181,6 +4240,8 @@ class ApplySolvedTypeVarsTransformer extends TypeVarTransformer {
                     replacement = ClassType.specialize(ClassType.cloneAsInstance(this._options.typeClassType), [
                         replacement,
                     ]);
+                } else if (isClassInstance(replacement) || isKindApplication(replacement) || isKindVar(replacement)) {
+                    // Already an instance — do not wrap with convertToInstantiable
                 } else {
                     replacement = convertToInstantiable(replacement, /* includeSubclasses */ false);
                 }

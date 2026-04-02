@@ -44,6 +44,9 @@ export const enum TypeCategory {
 
     // Type variable
     TypeVar,
+
+    // An applied KindVar, e.g. F[A] where F is a KindVar
+    KindApplication,
 }
 
 export const enum TypeFlags {
@@ -72,7 +75,8 @@ export type UnionableType =
     | OverloadedType
     | ClassType
     | ModuleType
-    | TypeVarType;
+    | TypeVarType
+    | KindApplicationType;
 
 export type Type = UnionableType | NeverType | UnionType;
 
@@ -2287,7 +2291,17 @@ export namespace FunctionType {
         assert(index < type.shared.parameters.length, 'Parameter types array overflow');
 
         if (type.priv.specializedTypes && index < type.priv.specializedTypes.parameterTypes.length) {
-            return type.priv.specializedTypes.parameterTypes[index];
+            const specialized = type.priv.specializedTypes.parameterTypes[index];
+            const shared = type.shared.parameters[index]._type;
+            // Only prefer shared KindApplication if specialized didn't resolve it to a concrete type
+            if (
+                shared?.category === TypeCategory.KindApplication &&
+                specialized.category !== TypeCategory.KindApplication &&
+                !TypeBase.isInstance(specialized)
+            ) {
+                return shared;
+            }
+            return specialized;
         }
 
         return type.shared.parameters[index]._type;
@@ -2327,7 +2341,17 @@ export namespace FunctionType {
 
     export function getEffectiveReturnType(type: FunctionType, includeInferred = true): Type | undefined {
         if (type.priv.specializedTypes?.returnType) {
-            return type.priv.specializedTypes.returnType;
+            const specialized = type.priv.specializedTypes.returnType;
+            const declared = type.shared.declaredReturnType;
+            // Prefer KindApplication from declared if specialization dropped it
+            if (
+                declared?.category === TypeCategory.KindApplication &&
+                specialized.category !== TypeCategory.KindApplication &&
+                !TypeBase.isInstance(specialized)
+            ) {
+                return declared;
+            }
+            return specialized;
         }
 
         if (type.shared.declaredReturnType) {
@@ -2756,6 +2780,7 @@ export enum TypeVarKind {
     TypeVar,
     TypeVarTuple,
     ParamSpec,
+    KindVar,
 }
 
 export interface TypeVarDetailsShared {
@@ -2864,6 +2889,43 @@ export interface TypeVarTupleDetailsPriv extends TypeVarDetailsPriv {
 export interface TypeVarTupleType extends TypeVarType {
     shared: TypeVarDetailsShared & { kind: TypeVarKind.TypeVarTuple };
     priv: TypeVarTupleDetailsPriv;
+}
+export interface KindVarDetailsPriv extends TypeVarDetailsPriv {
+    // The number of type variables a type constructor takes
+    kindArity?: number;
+
+    freeTypeVar?: KindVarType | undefined;
+}
+
+export interface KindVarType extends TypeVarType {
+    shared: TypeVarDetailsShared & { kind: TypeVarKind.KindVar };
+    priv: KindVarDetailsPriv;
+}
+
+export interface KindApplicationShared {
+    // The KindVar, e.g. F.
+    constructor: KindVarType;
+
+    // The applied type arguments, e.g. [A, B, ...].
+    args: readonly Type[];
+}
+
+export interface KindApplicationType extends TypeBase<TypeCategory.KindApplication> {
+    shared: KindApplicationShared;
+    priv: Record<string, never>;
+}
+
+export namespace KindApplicationType {
+    export function create(constructor: KindVarType, args: readonly Type[]): KindApplicationType {
+        return {
+            category: TypeCategory.KindApplication,
+            flags: TypeFlags.Instance,
+            props: undefined,
+            cached: undefined,
+            shared: { constructor, args },
+            priv: {},
+        };
+    }
 }
 
 export namespace TypeVarType {
@@ -3234,6 +3296,14 @@ export function isParamSpec(type: Type): type is ParamSpecType {
 
 export function isTypeVarTuple(type: Type): type is TypeVarTupleType {
     return type.category === TypeCategory.TypeVar && type.shared.kind === TypeVarKind.TypeVarTuple;
+}
+
+export function isKindVar(type: Type): type is KindVarType {
+    return type.category === TypeCategory.TypeVar && type.shared.kind === TypeVarKind.KindVar;
+}
+
+export function isKindApplication(type: Type): type is KindApplicationType {
+    return type.category === TypeCategory.KindApplication;
 }
 
 export function isUnpackedTypeVarTuple(type: Type): type is TypeVarTupleType {
